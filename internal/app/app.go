@@ -10,8 +10,10 @@ import (
 	"github.com/rajveermalviya/go-webgpu/wgpu"
 
 	"mapviewer/internal/camera"
+	"mapviewer/internal/config"
 	"mapviewer/internal/renderer"
 	"mapviewer/internal/tileserver"
+	"mapviewer/internal/vectortile"
 	"mapviewer/pkg/tiles"
 )
 
@@ -34,9 +36,10 @@ type App struct {
 	device   *wgpu.Device
 	queue    *wgpu.Queue
 
-	renderer  *renderer.Renderer
-	camera    *camera.Camera
-	tileCache *tileserver.TileCache
+	renderer        *renderer.Renderer
+	camera          *camera.Camera
+	tileCache       *tileserver.TileCache
+	vectorTileCache *vectortile.VectorTileCache
 
 	keys   map[glfw.Key]bool
 	keysMu sync.RWMutex
@@ -85,9 +88,15 @@ func New() (*App, error) {
 	}
 	app.tileCache = cache
 
+	// Initialize vector tile cache
+	app.vectorTileCache = vectortile.NewVectorTileCache()
+
+	// Load config
+	_ = config.Get()
+
 	app.camera = camera.NewCamera(AmsterdamLat, AmsterdamLon, DefaultZoom, DefaultWidth, DefaultHeight)
 
-	app.renderer, err = renderer.NewRenderer(app.adapter, app.device, app.queue, app.surface, uint32(DefaultWidth), uint32(DefaultHeight))
+	app.renderer, err = renderer.NewRenderer(app.adapter, app.device, app.queue, app.surface, uint32(DefaultWidth), uint32(DefaultHeight), app.vectorTileCache)
 	if err != nil {
 		return nil, fmt.Errorf("renderer creation failed: %w", err)
 	}
@@ -209,6 +218,21 @@ func (app *App) setupCallbacks() {
 			case glfw.KeyLeftShift, glfw.KeyRightShift:
 				app.camera.ZoomIn()
 				app.prefetchTiles()
+			case glfw.KeyEqual, glfw.KeyKPAdd: // + key (= on US keyboard)
+				newRadius := config.AdjustCityRadius(5.0)
+				fmt.Printf("City radius: %.0f%%\n", newRadius)
+			case glfw.KeyMinus, glfw.KeyKPSubtract: // - key
+				newRadius := config.AdjustCityRadius(-5.0)
+				fmt.Printf("City radius: %.0f%%\n", newRadius)
+			case glfw.Key0: // Reset to 0%
+				config.SetCityRadius(0)
+				fmt.Println("City radius: 0%")
+			case glfw.Key1: // Set to 100%
+				config.SetCityRadius(100)
+				fmt.Println("City radius: 100%")
+			case glfw.Key5: // Set to 50%
+				config.SetCityRadius(50)
+				fmt.Println("City radius: 50%")
 			}
 		}
 	})
@@ -271,6 +295,9 @@ func (app *App) prefetchTiles() {
 		default:
 		}
 	}
+
+	// Update city data for the current view
+	go app.renderer.UpdateCitiesForView(app.camera.Lat, app.camera.Lon, app.camera.Zoom)
 }
 
 func (app *App) loadVisibleTiles() {
@@ -300,7 +327,8 @@ func (app *App) Run() error {
 
 		frames++
 		if time.Since(lastTime) >= time.Second {
-			app.window.SetTitle(fmt.Sprintf("Map Viewer - Amsterdam | Zoom: %d | FPS: %d", app.camera.Zoom, frames))
+			radius := config.GetCityRadius()
+			app.window.SetTitle(fmt.Sprintf("Map Viewer | Zoom: %d | City: %.0f%% | FPS: %d", app.camera.Zoom, radius, frames))
 			frames = 0
 			lastTime = time.Now()
 		}

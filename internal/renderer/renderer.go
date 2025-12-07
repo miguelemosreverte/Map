@@ -7,12 +7,15 @@ import (
 	"image/color"
 	"image/draw"
 	_ "image/png"
+	"math"
 	"sync"
 	"unsafe"
 
 	"github.com/rajveermalviya/go-webgpu/wgpu"
 
 	"mapviewer/internal/camera"
+	"mapviewer/internal/config"
+	"mapviewer/internal/vectortile"
 	"mapviewer/pkg/tiles"
 )
 
@@ -26,10 +29,19 @@ type Vertex struct {
 
 // TileTexture holds GPU resources for a single tile
 type TileTexture struct {
-	Texture   *wgpu.Texture
-	View      *wgpu.TextureView
-	BindGroup *wgpu.BindGroup
+	Texture *wgpu.Texture
+	View    *wgpu.TextureView
 }
+
+// CityData represents a city for the mask shader (max 64 cities)
+type CityData struct {
+	X      float32 // Longitude
+	Y      float32 // Latitude
+	Radius float32 // Base radius (based on rank)
+	_      float32 // Padding for alignment
+}
+
+const MaxCities = 64
 
 // Renderer handles all WebGPU rendering
 type Renderer struct {
@@ -47,20 +59,27 @@ type Renderer struct {
 	textures    map[string]*TileTexture
 	texturesMu  sync.RWMutex
 
+	// City mask data
+	vectorTileCache *vectortile.VectorTileCache
+	cities          []CityData
+	citiesMu        sync.RWMutex
+
 	width  uint32
 	height uint32
 }
 
 // NewRenderer creates a new WebGPU renderer
-func NewRenderer(adapter *wgpu.Adapter, device *wgpu.Device, queue *wgpu.Queue, surface *wgpu.Surface, width, height uint32) (*Renderer, error) {
+func NewRenderer(adapter *wgpu.Adapter, device *wgpu.Device, queue *wgpu.Queue, surface *wgpu.Surface, width, height uint32, vectorTileCache *vectortile.VectorTileCache) (*Renderer, error) {
 	r := &Renderer{
-		adapter:  adapter,
-		device:   device,
-		queue:    queue,
-		surface:  surface,
-		width:    width,
-		height:   height,
-		textures: make(map[string]*TileTexture),
+		adapter:         adapter,
+		device:          device,
+		queue:           queue,
+		surface:         surface,
+		width:           width,
+		height:          height,
+		textures:        make(map[string]*TileTexture),
+		vectorTileCache: vectorTileCache,
+		cities:          make([]CityData, 0, MaxCities),
 	}
 
 	if err := r.init(); err != nil {
@@ -87,7 +106,7 @@ func (r *Renderer) init() error {
 		return fmt.Errorf("swap chain creation failed: %w", err)
 	}
 
-	// Create shader module - simple shader with position directly in NDC
+	// Create shader module with city mask support
 	shaderCode := `
 struct VertexInput {
     @location(0) position: vec2<f32>,
@@ -97,16 +116,34 @@ struct VertexInput {
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
     @location(0) texCoord: vec2<f32>,
+    @location(1) worldPos: vec2<f32>,
 }
 
 struct TileInfo {
     offset: vec2<f32>,
     scale: vec2<f32>,
+    // Geo bounds of this tile (minLon, minLat, maxLon, maxLat)
+    geoBounds: vec4<f32>,
+}
+
+struct CityMaskParams {
+    radiusPercent: f32,       // 0-100, controls city visibility
+    enableMask: f32,          // 1.0 = enabled, 0.0 = disabled
+    cityCount: f32,           // Number of active cities
+    baseRadius: f32,          // Base radius in degrees
+}
+
+struct City {
+    pos: vec2<f32>,     // lon, lat
+    radius: f32,        // base radius multiplier based on rank
+    _padding: f32,
 }
 
 @group(0) @binding(0) var<uniform> tile: TileInfo;
 @group(0) @binding(1) var tileSampler: sampler;
 @group(0) @binding(2) var tileTexture: texture_2d<f32>;
+@group(0) @binding(3) var<uniform> maskParams: CityMaskParams;
+@group(0) @binding(4) var<storage, read> cities: array<City>;
 
 @vertex
 fn vs_main(in: VertexInput) -> VertexOutput {
@@ -115,12 +152,62 @@ fn vs_main(in: VertexInput) -> VertexOutput {
     let pos = in.position * tile.scale + tile.offset;
     out.position = vec4<f32>(pos, 0.0, 1.0);
     out.texCoord = in.texCoord;
+
+    // Calculate world position (lon/lat) from texture coords and geo bounds
+    let lon = mix(tile.geoBounds.x, tile.geoBounds.z, in.texCoord.x);
+    let lat = mix(tile.geoBounds.w, tile.geoBounds.y, in.texCoord.y); // Y is flipped
+    out.worldPos = vec2<f32>(lon, lat);
+
     return out;
+}
+
+// Calculate distance between two lon/lat points (approximate, in degrees)
+fn geoDistance(p1: vec2<f32>, p2: vec2<f32>) -> f32 {
+    let latScale = cos(radians((p1.y + p2.y) * 0.5));
+    let dx = (p2.x - p1.x) * latScale;
+    let dy = p2.y - p1.y;
+    return sqrt(dx * dx + dy * dy);
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return textureSample(tileTexture, tileSampler, in.texCoord);
+    let texColor = textureSample(tileTexture, tileSampler, in.texCoord);
+
+    // If mask disabled or radius is 100%, show full texture
+    if (maskParams.enableMask < 0.5 || maskParams.radiusPercent >= 99.9) {
+        return texColor;
+    }
+
+    // If radius is 0%, show only sea (alpha = 0 for land)
+    if (maskParams.radiusPercent <= 0.1) {
+        // Return desaturated/fog color for areas outside cities
+        let fog = vec4<f32>(0.7, 0.75, 0.8, 1.0);
+        return fog;
+    }
+
+    // Calculate minimum distance to any city
+    var minDist: f32 = 1000.0;
+    let cityCount = i32(maskParams.cityCount);
+
+    for (var i: i32 = 0; i < cityCount; i = i + 1) {
+        let city = cities[i];
+        let dist = geoDistance(in.worldPos, city.pos);
+        // Adjust distance by city's radius multiplier
+        let adjustedDist = dist / max(city.radius, 0.1);
+        minDist = min(minDist, adjustedDist);
+    }
+
+    // Calculate effective radius based on slider (0-100%)
+    // Base radius is in degrees (~0.1 degrees = ~11km at equator)
+    let effectiveRadius = maskParams.baseRadius * (maskParams.radiusPercent / 100.0);
+
+    // Smooth falloff at city edges
+    let edge = effectiveRadius * 0.8;
+    let fade = smoothstep(effectiveRadius, edge, minDist);
+
+    // Mix between fog and texture based on distance
+    let fog = vec4<f32>(0.75, 0.8, 0.85, 1.0);
+    return mix(fog, texColor, fade);
 }
 `
 	shader, err := r.device.CreateShaderModule(&wgpu.ShaderModuleDescriptor{
@@ -152,7 +239,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 		Entries: []wgpu.BindGroupLayoutEntry{
 			{
 				Binding:    0,
-				Visibility: wgpu.ShaderStage_Vertex,
+				Visibility: wgpu.ShaderStage_Vertex | wgpu.ShaderStage_Fragment,
 				Buffer:     wgpu.BufferBindingLayout{Type: wgpu.BufferBindingType_Uniform},
 			},
 			{
@@ -167,6 +254,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 					SampleType:    wgpu.TextureSampleType_Float,
 					ViewDimension: wgpu.TextureViewDimension_2D,
 				},
+			},
+			{
+				Binding:    3,
+				Visibility: wgpu.ShaderStage_Fragment,
+				Buffer:     wgpu.BufferBindingLayout{Type: wgpu.BufferBindingType_Uniform},
+			},
+			{
+				Binding:    4,
+				Visibility: wgpu.ShaderStage_Fragment,
+				Buffer:     wgpu.BufferBindingLayout{Type: wgpu.BufferBindingType_ReadOnlyStorage},
 			},
 		},
 	})
@@ -277,35 +374,7 @@ func (r *Renderer) createTileTexture(img *image.RGBA) (*TileTexture, error) {
 		return nil, err
 	}
 
-	// Create uniform buffer for this tile
-	uniformBuffer, err := r.device.CreateBuffer(&wgpu.BufferDescriptor{
-		Label: "tile_uniform_buffer",
-		Size:  16, // 2 vec2<f32> = 16 bytes
-		Usage: wgpu.BufferUsage_Uniform | wgpu.BufferUsage_CopyDst,
-	})
-	if err != nil {
-		view.Release()
-		texture.Release()
-		return nil, err
-	}
-
-	bindGroup, err := r.device.CreateBindGroup(&wgpu.BindGroupDescriptor{
-		Label:  "tile_bind_group",
-		Layout: r.bindGroupLayout,
-		Entries: []wgpu.BindGroupEntry{
-			{Binding: 0, Buffer: uniformBuffer, Size: 16},
-			{Binding: 1, Sampler: r.sampler},
-			{Binding: 2, TextureView: view},
-		},
-	})
-	if err != nil {
-		uniformBuffer.Release()
-		view.Release()
-		texture.Release()
-		return nil, err
-	}
-
-	return &TileTexture{Texture: texture, View: view, BindGroup: bindGroup}, nil
+	return &TileTexture{Texture: texture, View: view}, nil
 }
 
 // UploadTile uploads a tile image to GPU
@@ -349,10 +418,102 @@ func (r *Renderer) HasTile(coord tiles.TileCoord) bool {
 
 // TileInfo matches shader uniform
 type TileInfo struct {
-	OffsetX float32
-	OffsetY float32
-	ScaleX  float32
-	ScaleY  float32
+	OffsetX   float32
+	OffsetY   float32
+	ScaleX    float32
+	ScaleY    float32
+	MinLon    float32
+	MinLat    float32
+	MaxLon    float32
+	MaxLat    float32
+}
+
+// CityMaskParams matches shader uniform
+type CityMaskParams struct {
+	RadiusPercent float32
+	EnableMask    float32
+	CityCount     float32
+	BaseRadius    float32
+}
+
+// tileToGeoBounds converts tile coordinates to geographic bounds
+func tileToGeoBounds(x, y, zoom int) (minLon, minLat, maxLon, maxLat float64) {
+	n := float64(int(1) << zoom)
+	minLon = float64(x)/n*360.0 - 180.0
+	maxLon = float64(x+1)/n*360.0 - 180.0
+
+	// Web Mercator to latitude conversion
+	maxLat = 180.0 / math.Pi * (2*math.Atan(math.Exp(math.Pi*(1-2*float64(y)/n))) - math.Pi/2)
+	minLat = 180.0 / math.Pi * (2*math.Atan(math.Exp(math.Pi*(1-2*float64(y+1)/n))) - math.Pi/2)
+	return
+}
+
+// UpdateCitiesForView fetches vector tile data for the current view and updates city positions
+func (r *Renderer) UpdateCitiesForView(lat, lon float64, zoom int) {
+	if r.vectorTileCache == nil {
+		return
+	}
+
+	// Convert lat/lon to tile coordinates at a lower zoom for city data
+	// Use zoom 10 for city data (covers larger area)
+	cityZoom := 10
+	if zoom < 10 {
+		cityZoom = zoom
+	}
+
+	// Calculate tile coordinates
+	n := float64(int(1) << cityZoom)
+	tileX := int((lon + 180.0) / 360.0 * n)
+	tileY := int((1.0 - math.Log(math.Tan(lat*math.Pi/180.0)+1.0/math.Cos(lat*math.Pi/180.0))/math.Pi) / 2.0 * n)
+
+	// Fetch surrounding tiles
+	cities := make([]CityData, 0, MaxCities)
+
+	for dy := -1; dy <= 1; dy++ {
+		for dx := -1; dx <= 1; dx++ {
+			tx := tileX + dx
+			ty := tileY + dy
+			if tx < 0 || ty < 0 || tx >= int(n) || ty >= int(n) {
+				continue
+			}
+
+			data, err := r.vectorTileCache.GetTile(cityZoom, tx, ty)
+			if err != nil {
+				continue
+			}
+
+			// Filter for cities and towns
+			for _, place := range data.Places {
+				if place.Class == "city" || place.Class == "town" {
+					// Calculate radius based on rank (lower rank = larger city)
+					radius := float32(1.0)
+					if place.Rank > 0 {
+						radius = float32(15.0 / float64(place.Rank+5))
+					}
+
+					cities = append(cities, CityData{
+						X:      float32(place.Location.Lon()),
+						Y:      float32(place.Location.Lat()),
+						Radius: radius,
+					})
+
+					if len(cities) >= MaxCities {
+						break
+					}
+				}
+			}
+			if len(cities) >= MaxCities {
+				break
+			}
+		}
+		if len(cities) >= MaxCities {
+			break
+		}
+	}
+
+	r.citiesMu.Lock()
+	r.cities = cities
+	r.citiesMu.Unlock()
 }
 
 // Render draws the map
@@ -413,6 +574,46 @@ func (r *Renderer) Render(cam *camera.Camera) error {
 	scaleX := float32(TileSize) / w * 2
 	scaleY := float32(TileSize) / h * 2
 
+	// Get config for city mask
+	cfg := config.Get()
+	radiusPercent := float32(cfg.Rendering.CityRadiusPercent)
+	enableMask := float32(0.0)
+	if cfg.Features.EnableCityMask {
+		enableMask = 1.0
+	}
+
+	// Get city data
+	r.citiesMu.RLock()
+	cityCount := len(r.cities)
+	cities := make([]CityData, len(r.cities))
+	copy(cities, r.cities)
+	r.citiesMu.RUnlock()
+
+	// Create mask params uniform buffer
+	maskParams := CityMaskParams{
+		RadiusPercent: radiusPercent,
+		EnableMask:    enableMask,
+		CityCount:     float32(cityCount),
+		BaseRadius:    0.15, // ~16km at equator
+	}
+	maskParamsBuffer, _ := r.device.CreateBufferInit(&wgpu.BufferInitDescriptor{
+		Label:    "mask_params_uniform",
+		Contents: wgpu.ToBytes([]CityMaskParams{maskParams}),
+		Usage:    wgpu.BufferUsage_Uniform,
+	})
+	defer maskParamsBuffer.Release()
+
+	// Create city storage buffer (need at least 1 element for valid buffer)
+	if len(cities) == 0 {
+		cities = append(cities, CityData{X: 0, Y: 0, Radius: 0})
+	}
+	cityBuffer, _ := r.device.CreateBufferInit(&wgpu.BufferInitDescriptor{
+		Label:    "city_storage",
+		Contents: wgpu.ToBytes(cities),
+		Usage:    wgpu.BufferUsage_Storage,
+	})
+	defer cityBuffer.Release()
+
 	for y := minY; y <= maxY; y++ {
 		for x := minX; x <= maxX; x++ {
 			coord := tiles.TileCoord{X: x, Y: y, Zoom: cam.Zoom}
@@ -424,23 +625,23 @@ func (r *Renderer) Render(cam *camera.Camera) error {
 			ndcX := (float32(screenX)/w)*2 - 1
 			ndcY := 1 - (float32(screenY)/h)*2 // Flip Y
 
+			// Get geographic bounds for this tile
+			minLon, minLat, maxLon, maxLat := tileToGeoBounds(x, y, cam.Zoom)
+
 			tileInfo := TileInfo{
 				OffsetX: ndcX,
 				OffsetY: ndcY - scaleY, // Move down by tile height (since we draw from top-left)
 				ScaleX:  scaleX,
 				ScaleY:  -scaleY, // Negative to flip texture vertically
+				MinLon:  float32(minLon),
+				MinLat:  float32(minLat),
+				MaxLon:  float32(maxLon),
+				MaxLat:  float32(maxLat),
 			}
 
 			r.texturesMu.RLock()
 			tex, exists := r.textures[coord.String()]
 			r.texturesMu.RUnlock()
-
-			var bindGroup *wgpu.BindGroup
-			if exists && tex != nil {
-				bindGroup = tex.BindGroup
-			} else {
-				bindGroup = r.placeholder.BindGroup
-			}
 
 			// Create temp uniform buffer for this draw
 			uniformBuffer, _ := r.device.CreateBufferInit(&wgpu.BufferInitDescriptor{
@@ -454,7 +655,7 @@ func (r *Renderer) Render(cam *camera.Camera) error {
 				Label:  "temp_tile_bind_group",
 				Layout: r.bindGroupLayout,
 				Entries: []wgpu.BindGroupEntry{
-					{Binding: 0, Buffer: uniformBuffer, Size: 16},
+					{Binding: 0, Buffer: uniformBuffer, Size: uint64(unsafe.Sizeof(TileInfo{}))},
 					{Binding: 1, Sampler: r.sampler},
 					{Binding: 2, TextureView: func() *wgpu.TextureView {
 						if exists && tex != nil {
@@ -462,14 +663,13 @@ func (r *Renderer) Render(cam *camera.Camera) error {
 						}
 						return r.placeholder.View
 					}()},
+					{Binding: 3, Buffer: maskParamsBuffer, Size: uint64(unsafe.Sizeof(CityMaskParams{}))},
+					{Binding: 4, Buffer: cityBuffer, Size: uint64(len(cities) * int(unsafe.Sizeof(CityData{})))},
 				},
 			})
 
 			pass.SetBindGroup(0, tempBindGroup, nil)
 			pass.DrawIndexed(6, 1, 0, 0, 0)
-
-			// Note: These will leak - in production we'd pool these
-			_ = bindGroup
 		}
 	}
 
@@ -516,14 +716,12 @@ func (r *Renderer) Resize(width, height uint32) {
 func (r *Renderer) Release() {
 	r.texturesMu.Lock()
 	for _, tex := range r.textures {
-		tex.BindGroup.Release()
 		tex.View.Release()
 		tex.Texture.Release()
 	}
 	r.texturesMu.Unlock()
 
 	if r.placeholder != nil {
-		r.placeholder.BindGroup.Release()
 		r.placeholder.View.Release()
 		r.placeholder.Texture.Release()
 	}
