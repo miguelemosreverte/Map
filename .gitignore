@@ -1,0 +1,14 @@
+# Binaries (root level only)
+/mapviewer
+*.exe
+
+# Tile cache
+.tile_cache/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
